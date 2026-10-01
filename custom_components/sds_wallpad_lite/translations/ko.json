@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Samsung SDS Wallpad Lite 연결 설정",
+        "description": "EW11 RS485 to Wi-Fi 어댑터의 소켓 정보를 입력해주세요.",
+        "data": {
+          "host": "EW11 IP 주소",
+          "port": "EW11 포트 번호",
+          "power_decimal": "소비전력 자릿수 나눔값 (10^N, 기본값 2)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "EW11 소켓에 연결할 수 없습니다. IP와 포트 번호를 확인해주세요."
+    },
+    "abort": {
+      "already_configured": "해당 기기는 이미 등록되어 있습니다."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Samsung SDS Wallpad Lite 옵션 설정",
+        "data": {
+          "host": "EW11 IP 주소",
+          "port": "EW11 포트 번호",
+          "power_decimal": "소비전력 자릿수 나눔값 (10^N, 기본값 2)"
+        }
+      }
+    }
+  }
+}
