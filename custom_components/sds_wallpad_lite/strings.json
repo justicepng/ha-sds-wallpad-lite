@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Samsung SDS Wallpad Lite Setup",
+        "description": "Enter the EW11 RS485 socket connection details.",
+        "data": {
+          "host": "EW11 IP Address",
+          "port": "EW11 Port",
+          "power_decimal": "Power Decimal Divisor (10^N, default 2)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to EW11 socket. Please check IP and port."
+    },
+    "abort": {
+      "already_configured": "Device is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Samsung SDS Wallpad Lite Options",
+        "data": {
+          "host": "EW11 IP Address",
+          "port": "EW11 Port",
+          "power_decimal": "Power Decimal Divisor (10^N, default 2)"
+        }
+      }
+    }
+  }
+}
