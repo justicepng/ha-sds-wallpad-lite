@@ -83,6 +83,7 @@ class SDSWallpadHub:
         self.power_consumption: float = 0.0
         self._consecutive_energy_scans: int = 0
         self._last_energy_ack_sent: float = 0.0
+        self._energy_ack_idx: int = 0
 
     @property
     def is_connected(self) -> bool:
@@ -426,14 +427,25 @@ class SDSWallpadHub:
         self._consecutive_energy_scans += 1
         now = time.time()
         # If Wallpad sends device scan queries >= 2 times, proactively send
-        # the authentic device scan ACK (B0 5A 0A 60) to break the scan loop.
-        if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 1.5):
+        # device scan ACK to break the scan loop and resume regular AA 6F polling.
+        if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 1.2):
             self._last_energy_ack_sent = now
             self._consecutive_energy_scans = 0
-            ack_packet = bytes([0xB0, 0x5A, 0x0A, 0x60])
+            # Cycle through known scan response candidates:
+            # 1. B0 5A 00 6A: Standard universal Samsung SDS device scan response
+            # 2. B0 5A 0A 60: Physical meter device signature observed in this apartment
+            # 3. B0 5A 14 7E: Documented 3-utility meter scan response
+            candidates = [
+                bytes([0xB0, 0x5A, 0x00, 0x6A]),
+                bytes([0xB0, 0x5A, 0x0A, 0x60]),
+                bytes([0xB0, 0x5A, 0x14, 0x7E]),
+            ]
+            ack_packet = candidates[self._energy_ack_idx % len(candidates)]
+            self._energy_ack_idx += 1
 
             _LOGGER.info(
-                "Wallpad energy scan loop detected (AA 5A). Sending auto-recovery scan ACK (B0 5A 0A 60)..."
+                "Wallpad energy scan loop detected (AA 5A). Sending auto-recovery scan ACK (%s)...",
+                ack_packet.hex(),
             )
             asyncio.create_task(self._send_energy_scan_ack(ack_packet))
 
