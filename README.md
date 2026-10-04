@@ -30,8 +30,8 @@
 | `climate` | `climate.sds_wallpad_sds_thermostat_1` | 거실 난방 | 난방 켜기/끄기, 현재/목표 온도 제어 (10~30℃) |
 | `climate` | `climate.sds_wallpad_sds_thermostat_2` | 안방 난방 | 난방 켜기/끄기, 현재/목표 온도 제어 |
 | `climate` | `climate.sds_wallpad_sds_thermostat_3` | 알파룸 난방 | 난방 켜기/끄기, 현재/목표 온도 제어 |
-| `climate` | `climate.sds_wallpad_sds_thermostat_4` | 유진방 난방 | 난방 켜기/끄기, 현재/목표 온도 제어 |
-| `climate` | `climate.sds_wallpad_sds_thermostat_5` | 상수방 난방 | 난방 켜기/끄기, 현재/목표 온도 제어 |
+| `climate` | `climate.sds_wallpad_sds_thermostat_4` | 작은방1 난방 | 난방 켜기/끄기, 현재/목표 온도 제어 |
+| `climate` | `climate.sds_wallpad_sds_thermostat_5` | 작은방2 난방 | 난방 켜기/끄기, 현재/목표 온도 제어 |
 | `sensor` | `sensor.sds_wallpad_sds_power_consumption` | SDS월패드 전기 사용량 | 실시간 소비전력 (W, 측정치) |
 
 ---
