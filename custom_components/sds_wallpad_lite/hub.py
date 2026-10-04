@@ -8,10 +8,12 @@ import time
 from typing import Any, Callable
 
 from .const import (
+    CMD_DEVICE_SCAN,
     CMD_ENERGY_STATE,
     CMD_THERMOSTAT_POWER,
     CMD_THERMOSTAT_STATE,
     CMD_THERMOSTAT_TEMP,
+    HEADER_ENERGY,
     HEADER_WALLPAD_CMD,
     HEADER_WALLPAD_STATE,
 )
@@ -79,6 +81,8 @@ class SDSWallpadHub:
             i: {"power": False, "target": 22.0, "current": 22.0} for i in range(1, 6)
         }
         self.power_consumption: float = 0.0
+        self._consecutive_energy_scans: int = 0
+        self._last_energy_ack_sent: float = 0.0
 
     @property
     def is_connected(self) -> bool:
@@ -310,6 +314,8 @@ class SDSWallpadHub:
                 elif cmd in (0x41, 0x5A, 0x52):
                     if len(buffer) < 4:
                         return
+                    if cmd == 0x5A:
+                        self._consecutive_energy_scans = 0
                     del buffer[:4]
                     continue
                 elif cmd == 0x4E:
@@ -336,11 +342,21 @@ class SDSWallpadHub:
                 del buffer[0]
                 continue
 
-            elif first_byte == 0xAA:  # Energy query (4 bytes)
+            elif first_byte == HEADER_ENERGY:  # 0xAA (Energy queries: AA 5A or AA 6F)
                 if len(buffer) < 4:
                     return
-                del buffer[:4]
-                continue
+                packet = buffer[:4]
+                if verify_checksum(packet):
+                    cmd = packet[1]
+                    if cmd == CMD_DEVICE_SCAN:
+                        self._handle_energy_scan_query()
+                    elif cmd == CMD_ENERGY_STATE:
+                        self._consecutive_energy_scans = 0
+                    del buffer[:4]
+                    continue
+                else:
+                    del buffer[0]
+                    continue
 
             elif first_byte in (0xAC, 0xAD, 0xC2, 0xC6, 0xAB):
                 del buffer[0]
@@ -405,14 +421,49 @@ class SDSWallpadHub:
             except Exception as err:
                 _LOGGER.error("Error in thermostat callback: %s", err)
 
+    def _handle_energy_scan_query(self) -> None:
+        """Handle Wallpad energy device scan query (AA 5A 00 70)."""
+        self._consecutive_energy_scans += 1
+        now = time.time()
+        # If the physical energy meter fails to respond and scan repeats >= 2 times,
+        # proactively send B0 5A 0A 60 to prevent the Wallpad from locking in scan mode.
+        if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 3.0):
+            self._last_energy_ack_sent = now
+            self._consecutive_energy_scans = 0
+            _LOGGER.info(
+                "Wallpad energy scan loop detected (AA 5A). Sending auto-recovery scan ACK (B0 5A 0A 60)..."
+            )
+            asyncio.create_task(self._send_energy_scan_ack())
+
+    async def _send_energy_scan_ack(self) -> None:
+        """Send device scan ACK (B0 5A 0A 60) with bus turnaround delay."""
+        if not self._connected or not self._writer:
+            return
+        async with self._send_lock:
+            try:
+                # 25ms delay for RS485 bus turnaround after AA 5A 00 70
+                await asyncio.sleep(0.025)
+                ack_packet = bytes([0xB0, 0x5A, 0x0A, 0x60])
+                self._writer.write(ack_packet)
+                await self._writer.drain()
+                _LOGGER.debug("Sent energy scan recovery packet: %s", ack_packet.hex())
+            except Exception as err:
+                _LOGGER.warning("Failed to send energy scan ACK: %s", err)
+
     def _handle_energy_packet(self, packet: bytes | bytearray) -> None:
         """Handle 7-byte energy state packet."""
         energy_type = packet[2]
         if energy_type != 0:
             return
 
+        self._consecutive_energy_scans = 0
+
         try:
             raw_hex = packet[3:6].hex()
+            if not raw_hex.isdigit():
+                _LOGGER.warning("Energy packet contains non-decimal BCD digits: %s", packet.hex())
+                return
+
             divisor = 10**self.power_decimal
             watt = float(raw_hex) / divisor
             self.power_consumption = round(watt, 1)
