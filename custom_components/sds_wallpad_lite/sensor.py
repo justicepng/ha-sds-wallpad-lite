@@ -11,6 +11,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfPower
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -31,7 +32,7 @@ async def async_setup_entry(
     async_add_entities([SDSPowerConsumptionSensor(hub, entry)])
 
 
-class SDSPowerConsumptionSensor(SensorEntity):
+class SDSPowerConsumptionSensor(RestoreEntity, SensorEntity):
     """Representation of the SDS Wallpad Real-time Power Consumption Sensor."""
 
     _attr_has_entity_name = False
@@ -61,6 +62,16 @@ class SDSPowerConsumptionSensor(SensorEntity):
 
     async def async_added_to_hass(self) -> None:
         """Register callback when added to Home Assistant."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state and last_state.state not in (None, "unknown", "unavailable"):
+            try:
+                val = float(last_state.state)
+                if val > 0.0:
+                    self._attr_native_value = val
+                    self._hub.power_consumption = val
+            except ValueError:
+                pass
         self._hub.register_power_callback(self._on_power_update)
 
     def _on_power_update(self, watt: float) -> None:
