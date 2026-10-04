@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
-from typing import Callable
+import time
+from typing import Any, Callable
 
 from .const import (
     CMD_ENERGY_STATE,
@@ -33,8 +35,21 @@ def verify_checksum(packet: bytes | bytearray) -> bool:
     return (checksum & 0x7F) == 0
 
 
+@dataclass
+class QueuedCommand:
+    """Class for tracking pending RS485 commands with retry."""
+
+    cmd_type: str  # "power" or "temp"
+    room_id: int
+    target_value: Any  # bool for power, int for temp
+    packet: bytes
+    created_at: float
+    last_sent_at: float = 0.0
+    retries: int = 0
+
+
 class SDSWallpadHub:
-    """Hub communicating with EW11 via TCP socket."""
+    """Hub communicating with EW11 via TCP socket with robust command queue."""
 
     def __init__(self, host: str, port: int, power_decimal: int = 2) -> None:
         """Initialize the hub."""
@@ -46,15 +61,17 @@ class SDSWallpadHub:
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._socket_task: asyncio.Task | None = None
+        self._retry_task: asyncio.Task | None = None
+        self._send_lock = asyncio.Lock()
+
+        # Command Queue: (room_id, cmd_type) -> QueuedCommand
+        self._queue: dict[tuple[int, str], QueuedCommand] = {}
 
         # Callbacks
-        # thermostat_callbacks[room_id] = list of Callable[[bool, float, float], None]
-        # (power_on, target_temp, current_temp)
         self._thermostat_callbacks: dict[int, list[Callable[[bool, float, float], None]]] = {
             i: [] for i in range(1, 6)
         }
-        # power_callbacks = list of Callable[[float], None]
         self._power_callbacks: list[Callable[[float], None]] = []
 
         # Last known states
@@ -80,17 +97,24 @@ class SDSWallpadHub:
         self._power_callbacks.append(callback)
 
     async def start(self) -> None:
-        """Start the hub socket listener."""
+        """Start the hub socket listener and retry worker."""
         self._running = True
-        self._task = asyncio.create_task(self._socket_loop())
+        self._socket_task = asyncio.create_task(self._socket_loop())
+        self._retry_task = asyncio.create_task(self._retry_loop())
 
     async def stop(self) -> None:
-        """Stop the hub socket listener."""
+        """Stop the hub socket listener and workers."""
         self._running = False
-        if self._task:
-            self._task.cancel()
+        if self._retry_task:
+            self._retry_task.cancel()
             try:
-                await self._task
+                await self._retry_task
+            except asyncio.CancelledError:
+                pass
+        if self._socket_task:
+            self._socket_task.cancel()
+            try:
+                await self._socket_task
             except asyncio.CancelledError:
                 pass
         await self._disconnect()
@@ -153,60 +177,152 @@ class SDSWallpadHub:
             if self._running:
                 await asyncio.sleep(5.0)
 
+    async def _retry_loop(self) -> None:
+        """Background worker to retry queued commands periodically."""
+        while self._running:
+            try:
+                await asyncio.sleep(0.3)
+                if not self._connected or not self._queue:
+                    continue
+
+                now = time.time()
+                keys_to_remove: list[tuple[int, str]] = []
+
+                # Copy items to safely iterate
+                items = list(self._queue.items())
+                for key, cmd in items:
+                    # Timeout after 20 seconds
+                    if now - cmd.created_at > 20.0:
+                        _LOGGER.warning(
+                            "Thermostat [Room %s %s] command timed out after 20s (sent %s times).",
+                            cmd.room_id,
+                            cmd.cmd_type,
+                            cmd.retries,
+                        )
+                        keys_to_remove.append(key)
+                        continue
+
+                    # Resend if at least 0.3s passed since last transmission
+                    if now - cmd.last_sent_at >= 0.3:
+                        await self._send_command(cmd)
+
+                for k in keys_to_remove:
+                    self._queue.pop(k, None)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                _LOGGER.error("Error in retry loop: %s", err)
+
+    async def _send_command(self, cmd: QueuedCommand) -> bool:
+        """Send a single RS485 command through the writer."""
+        if not self._connected or not self._writer:
+            return False
+
+        async with self._send_lock:
+            try:
+                self._writer.write(cmd.packet)
+                await self._writer.drain()
+                cmd.last_sent_at = time.time()
+                cmd.retries += 1
+                _LOGGER.debug(
+                    "Sent RS485 command [Room %s %s -> %s] (try #%s): %s",
+                    cmd.room_id,
+                    cmd.cmd_type,
+                    cmd.target_value,
+                    cmd.retries,
+                    cmd.packet.hex(),
+                )
+                return True
+            except Exception as err:
+                _LOGGER.warning("Failed to send command over socket: %s", err)
+                return False
+
+    def _trigger_next_queued_send(self) -> None:
+        """Trigger immediate send of queued commands right after bus clears."""
+        if not self._queue or not self._connected:
+            return
+
+        now = time.time()
+        for cmd in self._queue.values():
+            if now - cmd.last_sent_at >= 0.15:
+                asyncio.create_task(self._send_command(cmd))
+                break  # Send one command per timing slot to prevent collision
+
     def _process_buffer(self, buffer: bytearray) -> None:
-        """Scan buffer for valid SDS RS485 packets."""
+        """Scan buffer for valid SDS RS485 packets and detect ACKs."""
         while len(buffer) >= 4:
-            # SDS state packet always starts with 0xB0
-            # SDS query/command packet starts with 0xAE or 0xAA etc.
             first_byte = buffer[0]
 
             if first_byte == HEADER_WALLPAD_STATE:
                 cmd = buffer[1]
+
                 # 1. Thermostat state: B0 7C [room] [power] [target] [current] [00] [parity] (8 bytes)
                 if cmd == CMD_THERMOSTAT_STATE:
                     if len(buffer) < 8:
-                        return  # Wait for more bytes
+                        return
                     packet = buffer[:8]
                     if verify_checksum(packet):
                         self._handle_thermostat_packet(packet)
                         del buffer[:8]
+                        # Best timing window: Bus is idle right after state packet!
+                        self._trigger_next_queued_send()
                         continue
                     else:
-                        # Corrupted or misaligned
                         del buffer[0]
                         continue
 
-                # 2. Energy state: B0 6F [type] [d1] [d2] [d3] [parity] (7 bytes)
+                # 2. Thermostat ACK: B0 7D (Power ACK) or B0 7F (Temp ACK) (8 bytes or 4 bytes)
+                elif cmd in (CMD_THERMOSTAT_POWER, CMD_THERMOSTAT_TEMP):
+                    if len(buffer) < 4:
+                        return
+                    room_id = buffer[2]
+                    cmd_type = "power" if cmd == CMD_THERMOSTAT_POWER else "temp"
+                    key = (room_id, cmd_type)
+                    if key in self._queue:
+                        q_cmd = self._queue.pop(key)
+                        _LOGGER.info(
+                            "Thermostat [Room %s %s] ACK received! (Elapsed: %.2fs, retries: %s)",
+                            room_id,
+                            cmd_type,
+                            time.time() - q_cmd.created_at,
+                            q_cmd.retries,
+                        )
+                    del buffer[:4]
+                    self._trigger_next_queued_send()
+                    continue
+
+                # 3. Energy state: B0 6F [type] [d1] [d2] [d3] [parity] (7 bytes)
                 elif cmd == CMD_ENERGY_STATE:
                     if len(buffer) < 7:
-                        return  # Wait for more bytes
+                        return
                     packet = buffer[:7]
                     if verify_checksum(packet):
                         self._handle_energy_packet(packet)
                         del buffer[:7]
+                        self._trigger_next_queued_send()
                         continue
                     else:
                         del buffer[0]
                         continue
 
                 # Known other 0xB0 packets to discard cleanly
-                elif cmd in (0x41, 0x5A, 0x52):  # 4 bytes ACK / status
+                elif cmd in (0x41, 0x5A, 0x52):
                     if len(buffer) < 4:
                         return
                     del buffer[:4]
                     continue
-                elif cmd == 0x4E:  # Fan (6 bytes)
+                elif cmd == 0x4E:
                     if len(buffer) < 6:
                         return
                     del buffer[:6]
                     continue
-                elif cmd == 0x4A:  # Plug (10 bytes)
+                elif cmd == 0x4A:
                     if len(buffer) < 10:
                         return
                     del buffer[:10]
                     continue
                 else:
-                    # Unknown 0xB0 packet, advance 1 byte
                     del buffer[0]
                     continue
 
@@ -227,11 +343,9 @@ class SDSWallpadHub:
                 continue
 
             elif first_byte in (0xAC, 0xAD, 0xC2, 0xC6, 0xAB):
-                # Other known wallpad device packets, skip safely
                 del buffer[0]
                 continue
             else:
-                # Noise / sync search
                 del buffer[0]
 
     def _handle_thermostat_packet(self, packet: bytes | bytearray) -> None:
@@ -250,6 +364,33 @@ class SDSWallpadHub:
             "current": current_temp,
         }
 
+        # Check if pending queued commands are confirmed by this state update
+        power_key = (room_id, "power")
+        if power_key in self._queue:
+            q_cmd = self._queue[power_key]
+            if q_cmd.target_value == power_on:
+                _LOGGER.info(
+                    "Thermostat [Room %s Power -> %s] Confirmed by state packet! (Elapsed: %.2fs, tries: %s)",
+                    room_id,
+                    power_on,
+                    time.time() - q_cmd.created_at,
+                    q_cmd.retries,
+                )
+                self._queue.pop(power_key, None)
+
+        temp_key = (room_id, "temp")
+        if temp_key in self._queue:
+            q_cmd = self._queue[temp_key]
+            if int(round(q_cmd.target_value)) == int(round(target_temp)):
+                _LOGGER.info(
+                    "Thermostat [Room %s Temp -> %s] Confirmed by state packet! (Elapsed: %.2fs, tries: %s)",
+                    room_id,
+                    target_temp,
+                    time.time() - q_cmd.created_at,
+                    q_cmd.retries,
+                )
+                self._queue.pop(temp_key, None)
+
         _LOGGER.debug(
             "Thermostat [Room %s] State: Power=%s, Target=%s, Current=%s",
             room_id,
@@ -267,12 +408,10 @@ class SDSWallpadHub:
     def _handle_energy_packet(self, packet: bytes | bytearray) -> None:
         """Handle 7-byte energy state packet."""
         energy_type = packet[2]
-        # energy_type 0: Electricity (Power)
         if energy_type != 0:
             return
 
         try:
-            # 6-decimal BCD representation (e.g. 05 49 00 -> "054900")
             raw_hex = packet[3:6].hex()
             divisor = 10**self.power_decimal
             watt = float(raw_hex) / divisor
@@ -294,42 +433,54 @@ class SDSWallpadHub:
             _LOGGER.warning("Failed to parse energy packet: %s (%s)", packet.hex(), err)
 
     async def async_send_thermostat_power(self, room_id: int, power_on: bool) -> bool:
-        """Send power command to room thermostat (AE 7D)."""
-        if not self._connected or not self._writer:
-            _LOGGER.error("Cannot send command: not connected to EW11")
-            return False
-
-        # Packet: AE 7D [room] [01/00] 00 00 00 [checksum] (8 bytes)
+        """Queue and send power command to room thermostat (AE 7D)."""
         raw = bytearray([0xAE, CMD_THERMOSTAT_POWER, room_id, 0x01 if power_on else 0x00, 0x00, 0x00, 0x00])
         cs = calculate_checksum(raw)
         raw.append(cs)
 
-        try:
-            self._writer.write(raw)
-            await self._writer.drain()
-            _LOGGER.debug("Sent Thermostat Power Cmd: %s", raw.hex())
-            return True
-        except Exception as err:
-            _LOGGER.error("Failed to send thermostat power command: %s", err)
-            return False
+        now = time.time()
+        cmd = QueuedCommand(
+            cmd_type="power",
+            room_id=room_id,
+            target_value=power_on,
+            packet=bytes(raw),
+            created_at=now,
+        )
+        self._queue[(room_id, "power")] = cmd
+
+        _LOGGER.info(
+            "Queued Thermostat Power Command: Room %s -> %s (packet: %s)",
+            room_id,
+            "ON" if power_on else "OFF",
+            raw.hex(),
+        )
+
+        # Attempt immediate send
+        return await self._send_command(cmd)
 
     async def async_send_thermostat_target_temp(self, room_id: int, target_temp: float) -> bool:
-        """Send target temperature command to room thermostat (AE 7F)."""
-        if not self._connected or not self._writer:
-            _LOGGER.error("Cannot send command: not connected to EW11")
-            return False
-
-        # Packet: AE 7F [room] [temp] 00 00 00 [checksum] (8 bytes)
+        """Queue and send target temperature command to room thermostat (AE 7F)."""
         temp_val = int(round(target_temp))
         raw = bytearray([0xAE, CMD_THERMOSTAT_TEMP, room_id, temp_val, 0x00, 0x00, 0x00])
         cs = calculate_checksum(raw)
         raw.append(cs)
 
-        try:
-            self._writer.write(raw)
-            await self._writer.drain()
-            _LOGGER.debug("Sent Thermostat Target Temp Cmd: %s", raw.hex())
-            return True
-        except Exception as err:
-            _LOGGER.error("Failed to send thermostat temp command: %s", err)
-            return False
+        now = time.time()
+        cmd = QueuedCommand(
+            cmd_type="temp",
+            room_id=room_id,
+            target_value=temp_val,
+            packet=bytes(raw),
+            created_at=now,
+        )
+        self._queue[(room_id, "temp")] = cmd
+
+        _LOGGER.info(
+            "Queued Thermostat Temp Command: Room %s -> %s℃ (packet: %s)",
+            room_id,
+            temp_val,
+            raw.hex(),
+        )
+
+        # Attempt immediate send
+        return await self._send_command(cmd)
