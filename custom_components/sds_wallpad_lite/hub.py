@@ -425,24 +425,15 @@ class SDSWallpadHub:
         """Handle Wallpad energy device scan query (AA 5A 00 70)."""
         self._consecutive_energy_scans += 1
         now = time.time()
-        # If the physical energy meter fails to respond and scan repeats >= 2 times,
-        # proactively send device scan ACK to break the Wallpad scan lock.
+        # If Wallpad sends device scan queries >= 2 times, proactively send
+        # the authentic device scan ACK (B0 5A 0A 60) to break the scan loop.
         if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 1.5):
             self._last_energy_ack_sent = now
-            # Primary candidate: B0 5A 0A 60 (observed in this complex)
-            # Secondary candidate: B0 5A 00 6A (standard universal SDS scan ACK)
-            # Tertiary candidate: B0 5A 14 7E (documented 3-meter scan ACK)
-            if self._consecutive_energy_scans < 6:
-                ack_packet = bytes([0xB0, 0x5A, 0x0A, 0x60])
-            elif self._consecutive_energy_scans < 12:
-                ack_packet = bytes([0xB0, 0x5A, 0x00, 0x6A])
-            else:
-                ack_packet = bytes([0xB0, 0x5A, 0x14, 0x7E])
+            self._consecutive_energy_scans = 0
+            ack_packet = bytes([0xB0, 0x5A, 0x0A, 0x60])
 
             _LOGGER.info(
-                "Wallpad energy scan loop detected (AA 5A, count=%s). Sending auto-recovery scan ACK (%s)...",
-                self._consecutive_energy_scans,
-                ack_packet.hex(),
+                "Wallpad energy scan loop detected (AA 5A). Sending auto-recovery scan ACK (B0 5A 0A 60)..."
             )
             asyncio.create_task(self._send_energy_scan_ack(ack_packet))
 
