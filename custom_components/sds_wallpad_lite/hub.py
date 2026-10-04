@@ -426,27 +426,37 @@ class SDSWallpadHub:
         self._consecutive_energy_scans += 1
         now = time.time()
         # If the physical energy meter fails to respond and scan repeats >= 2 times,
-        # proactively send B0 5A 0A 60 to prevent the Wallpad from locking in scan mode.
-        if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 3.0):
+        # proactively send device scan ACK to break the Wallpad scan lock.
+        if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 1.5):
             self._last_energy_ack_sent = now
-            self._consecutive_energy_scans = 0
-            _LOGGER.info(
-                "Wallpad energy scan loop detected (AA 5A). Sending auto-recovery scan ACK (B0 5A 0A 60)..."
-            )
-            asyncio.create_task(self._send_energy_scan_ack())
+            # Primary candidate: B0 5A 0A 60 (observed in this complex)
+            # Secondary candidate: B0 5A 00 6A (standard universal SDS scan ACK)
+            # Tertiary candidate: B0 5A 14 7E (documented 3-meter scan ACK)
+            if self._consecutive_energy_scans < 6:
+                ack_packet = bytes([0xB0, 0x5A, 0x0A, 0x60])
+            elif self._consecutive_energy_scans < 12:
+                ack_packet = bytes([0xB0, 0x5A, 0x00, 0x6A])
+            else:
+                ack_packet = bytes([0xB0, 0x5A, 0x14, 0x7E])
 
-    async def _send_energy_scan_ack(self) -> None:
-        """Send device scan ACK (B0 5A 0A 60) with bus turnaround delay."""
+            _LOGGER.info(
+                "Wallpad energy scan loop detected (AA 5A, count=%s). Sending auto-recovery scan ACK (%s)...",
+                self._consecutive_energy_scans,
+                ack_packet.hex(),
+            )
+            asyncio.create_task(self._send_energy_scan_ack(ack_packet))
+
+    async def _send_energy_scan_ack(self, ack_packet: bytes) -> None:
+        """Send device scan ACK with RS485 bus turnaround delay."""
         if not self._connected or not self._writer:
             return
         async with self._send_lock:
             try:
-                # 25ms delay for RS485 bus turnaround after AA 5A 00 70
-                await asyncio.sleep(0.025)
-                ack_packet = bytes([0xB0, 0x5A, 0x0A, 0x60])
+                # 12ms delay for RS485 bus turnaround after AA 5A 00 70
+                await asyncio.sleep(0.012)
                 self._writer.write(ack_packet)
                 await self._writer.drain()
-                _LOGGER.debug("Sent energy scan recovery packet: %s", ack_packet.hex())
+                _LOGGER.info("Successfully sent energy scan recovery packet: %s", ack_packet.hex())
             except Exception as err:
                 _LOGGER.warning("Failed to send energy scan ACK: %s", err)
 
