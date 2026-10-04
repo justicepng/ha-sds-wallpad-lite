@@ -426,42 +426,32 @@ class SDSWallpadHub:
         """Handle Wallpad energy device scan query (AA 5A 00 70)."""
         self._consecutive_energy_scans += 1
         now = time.time()
-        # If Wallpad sends device scan queries >= 2 times, proactively send
-        # device scan ACK to break the scan loop and resume regular AA 6F polling.
-        if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 1.2):
+        # If Wallpad sends device scan queries >= 2 times, proactively inject
+        # Energy Query (AA 6F 00 45) to query the physical meter directly and
+        # transition the Wallpad back into its regular 3-utility polling loop.
+        if self._consecutive_energy_scans >= 2 and (now - self._last_energy_ack_sent >= 1.5):
             self._last_energy_ack_sent = now
             self._consecutive_energy_scans = 0
-            # Cycle through known scan response candidates:
-            # 1. B0 5A 00 6A: Standard universal Samsung SDS device scan response
-            # 2. B0 5A 0A 60: Physical meter device signature observed in this apartment
-            # 3. B0 5A 14 7E: Documented 3-utility meter scan response
-            candidates = [
-                bytes([0xB0, 0x5A, 0x00, 0x6A]),
-                bytes([0xB0, 0x5A, 0x0A, 0x60]),
-                bytes([0xB0, 0x5A, 0x14, 0x7E]),
-            ]
-            ack_packet = candidates[self._energy_ack_idx % len(candidates)]
-            self._energy_ack_idx += 1
+            query_packet = bytes([0xAA, 0x6F, 0x00, 0x45])
 
             _LOGGER.info(
-                "Wallpad energy scan loop detected (AA 5A). Sending auto-recovery scan ACK (%s)...",
-                ack_packet.hex(),
+                "Wallpad energy scan loop detected (AA 5A). Injecting energy query (AA 6F 00 45) to resume polling..."
             )
-            asyncio.create_task(self._send_energy_scan_ack(ack_packet))
+            asyncio.create_task(self._send_energy_recovery_query(query_packet))
 
-    async def _send_energy_scan_ack(self, ack_packet: bytes) -> None:
-        """Send device scan ACK with RS485 bus turnaround delay."""
+    async def _send_energy_recovery_query(self, query_packet: bytes) -> None:
+        """Send energy recovery query with RS485 bus turnaround delay."""
         if not self._connected or not self._writer:
             return
         async with self._send_lock:
             try:
-                # 12ms delay for RS485 bus turnaround after AA 5A 00 70
-                await asyncio.sleep(0.012)
-                self._writer.write(ack_packet)
+                # 20ms delay for RS485 bus turnaround after AA 5A 00 70
+                await asyncio.sleep(0.020)
+                self._writer.write(query_packet)
                 await self._writer.drain()
-                _LOGGER.info("Successfully sent energy scan recovery packet: %s", ack_packet.hex())
+                _LOGGER.info("Successfully injected energy recovery query: %s", query_packet.hex())
             except Exception as err:
-                _LOGGER.warning("Failed to send energy scan ACK: %s", err)
+                _LOGGER.warning("Failed to send energy recovery query: %s", err)
 
     def _handle_energy_packet(self, packet: bytes | bytearray) -> None:
         """Handle 7-byte energy state packet."""
