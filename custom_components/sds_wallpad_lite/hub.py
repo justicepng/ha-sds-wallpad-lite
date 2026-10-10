@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import logging
+import socket
 import time
 from typing import Any, Callable
 
@@ -83,7 +84,9 @@ class SDSWallpadHub:
         self.power_consumption: float = 0.0
         self._consecutive_energy_scans: int = 0
         self._last_energy_ack_sent: float = 0.0
-        self._energy_ack_idx: int = 0
+        self._last_energy_packet_received: float = 0.0
+        self._last_data_received_at: float = 0.0
+        self._watchdog_task: asyncio.Task | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -102,14 +105,23 @@ class SDSWallpadHub:
         self._power_callbacks.append(callback)
 
     async def start(self) -> None:
-        """Start the hub socket listener and retry worker."""
+        """Start the hub socket listener and background workers."""
         self._running = True
+        self._last_data_received_at = time.time()
+        self._last_energy_packet_received = time.time()
         self._socket_task = asyncio.create_task(self._socket_loop())
         self._retry_task = asyncio.create_task(self._retry_loop())
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     async def stop(self) -> None:
         """Stop the hub socket listener and workers."""
         self._running = False
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
         if self._retry_task:
             self._retry_task.cancel()
             try:
@@ -125,16 +137,17 @@ class SDSWallpadHub:
         await self._disconnect()
 
     async def _disconnect(self) -> None:
-        """Close connection."""
+        """Close connection safely without hanging."""
         self._connected = False
-        if self._writer:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
+        writer = self._writer
         self._reader = None
         self._writer = None
+        if writer:
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except Exception:
+                pass
 
     async def _socket_loop(self) -> None:
         """Continuous connection and reading loop with auto-reconnect."""
@@ -151,6 +164,22 @@ class SDSWallpadHub:
                     asyncio.open_connection(self.host, self.port), timeout=10.0
                 )
                 self._connected = True
+                self._last_data_received_at = time.time()
+
+                # Enable TCP Keepalive
+                sock = self._writer.get_extra_info("socket")
+                if sock:
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        if hasattr(socket, "TCP_KEEPIDLE"):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+                        if hasattr(socket, "TCP_KEEPINTVL"):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+                        if hasattr(socket, "TCP_KEEPCNT"):
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                    except Exception:
+                        pass
+
                 _LOGGER.info(
                     "Successfully connected to Samsung SDS EW11 at %s:%s",
                     self.host,
@@ -159,11 +188,21 @@ class SDSWallpadHub:
                 buffer.clear()
 
                 while self._running and self._connected:
-                    data = await self._reader.read(256)
+                    # SDS RS485 bus streams packets continuously (< 1s interval).
+                    # If 10s pass without bytes, the socket is dead/hung (half-open).
+                    try:
+                        data = await asyncio.wait_for(self._reader.read(256), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning(
+                            "No RS485 packets received from EW11 for 10s. Socket appears frozen/dead. Triggering auto-reconnect..."
+                        )
+                        break
+
                     if not data:
                         _LOGGER.warning("EW11 socket connection closed by remote peer.")
                         break
 
+                    self._last_data_received_at = time.time()
                     buffer.extend(data)
                     self._process_buffer(buffer)
 
@@ -171,7 +210,7 @@ class SDSWallpadHub:
                 break
             except Exception as err:
                 _LOGGER.warning(
-                    "EW11 socket connection error (%s:%s): %s. Reconnecting in 5s...",
+                    "EW11 socket connection error (%s:%s): %s. Reconnecting in 3s...",
                     self.host,
                     self.port,
                     err,
@@ -180,7 +219,40 @@ class SDSWallpadHub:
                 await self._disconnect()
 
             if self._running:
+                await asyncio.sleep(3.0)
+
+    async def _watchdog_loop(self) -> None:
+        """Watchdog to ensure continuous packet stream and heal zombie connections."""
+        while self._running:
+            try:
                 await asyncio.sleep(5.0)
+                now = time.time()
+
+                # 1. Check socket liveness: If connected but no packets for >= 20s, force reset
+                if self._connected:
+                    idle_time = now - self._last_data_received_at
+                    if idle_time > 20.0:
+                        _LOGGER.warning(
+                            "Watchdog: No RS485 packets for %.1fs (limit 20s). Forcefully resetting socket to heal connection...",
+                            idle_time,
+                        )
+                        await self._disconnect()
+                        continue
+
+                # 2. Check energy meter polling: If no energy packets received for >= 30s, inject query
+                if self._connected and (now - self._last_energy_packet_received > 30.0):
+                    if now - self._last_energy_ack_sent >= 5.0:
+                        self._last_energy_ack_sent = now
+                        _LOGGER.info(
+                            "Watchdog: Energy data stale (>30s). Injecting energy query (AA 6F 00 45)..."
+                        )
+                        query_packet = bytes([0xAA, 0x6F, 0x00, 0x45])
+                        asyncio.create_task(self._send_energy_recovery_query(query_packet))
+
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                _LOGGER.error("Error in hub watchdog loop: %s", err)
 
     async def _retry_loop(self) -> None:
         """Background worker to retry queued commands periodically."""
@@ -460,6 +532,7 @@ class SDSWallpadHub:
             return
 
         self._consecutive_energy_scans = 0
+        self._last_energy_packet_received = time.time()
 
         try:
             raw_hex = packet[3:6].hex()
