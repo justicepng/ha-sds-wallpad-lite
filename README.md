@@ -18,8 +18,11 @@
 2. **기존 엔티티 및 통계 100% 승계**:
    - `climate.sds_wallpad_sds_thermostat_1` ~ `5` 난방 엔티티 ID 완벽 호환
    - `sensor.sds_wallpad_sds_power_consumption` 엔티티 ID 및 단위(W)를 그대로 유지하므로, 기존에 연결된 **리만적분(Riemann sum, `sensor.sds_energy`)과 유틸리티 미터(일간/월간 에너지 통계)가 초기화 없이 그대로 연속 동작**합니다.
-3. **네트워크 단절 시 자동 재연결(Auto-reconnect)** 내장.
-4. **HACS 표준 호환 및 UI Config Flow 지원**: YAML 수정 없이 HA UI에서 바로 설정 가능.
+3. **24/7 자가 치유(Self-Healing) 및 워치독 탑재 (v1.0.9)**:
+   - 소켓 수신 10초 타임아웃과 20초 주기 백그라운드 워치독을 통해 Wi-Fi 순단이나 Half-Open 좀비 소켓 발생 시 **10~20초 내에 자동으로 감지하고 자가 재연결**.
+   - 전력량 데이터 미수신 시 능동 쿼리(`AA 6F 00 45`)를 자동 주입하여 365일 무중단 수신 보장.
+4. **Home Assistant 2026.3+ 네이티브 브랜드 아이콘/로고 공식 지원**: `brand/` 규격을 준수하여 통합구성요소 카드에 깔끔한 전용 아이콘 표시.
+5. **HACS 표준 호환 및 UI Config Flow 지원**: YAML 수정 없이 HA UI에서 바로 설정 가능.
 
 ---
 
