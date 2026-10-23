@@ -112,6 +112,7 @@ class SDSWallpadHub:
         self._socket_task = asyncio.create_task(self._socket_loop())
         self._retry_task = asyncio.create_task(self._retry_loop())
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        asyncio.create_task(self._probe_cctv_endpoints())
 
     async def stop(self) -> None:
         """Stop the hub socket listener and workers."""
@@ -253,6 +254,52 @@ class SDSWallpadHub:
                 break
             except Exception as err:
                 _LOGGER.error("Error in hub watchdog loop: %s", err)
+
+    async def _probe_cctv_endpoints(self) -> None:
+        """Probe Web TX CCTV endpoints (10.2.1.41~44) to discover open ports and streaming protocols."""
+        await asyncio.sleep(2.0)  # Wait for main socket loop to settle
+        _LOGGER.warning("=== 🔍 Starting CCTV Web TX Probing (10.2.1.41~44, 10.2.1.9) ===")
+        targets = ["10.2.1.9", "10.2.1.41", "10.2.1.42", "10.2.1.43", "10.2.1.44"]
+        ports = [80, 554, 8000, 8080, 8554, 8899, 9000, 3000, 8081, 5000]
+
+        for ip in targets:
+            for port in ports:
+                try:
+                    r, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=1.0)
+                    w.close()
+                    await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+                    _LOGGER.warning(">>> CCTV PROBE HIT: %s:%s is OPEN!", ip, port)
+
+                    # Try HTTP GET for web ports
+                    if port in (80, 8080, 8000, 3000, 8081, 5000):
+                        try:
+                            r2, w2 = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=1.5)
+                            w2.write(f"GET / HTTP/1.1\r\nHost: {ip}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".encode())
+                            await w2.drain()
+                            resp = await asyncio.wait_for(r2.read(1024), timeout=1.5)
+                            w2.close()
+                            await asyncio.wait_for(w2.wait_closed(), timeout=1.0)
+                            header_lines = resp.decode(errors='ignore').split("\r\n")[:6]
+                            _LOGGER.warning(">>> CCTV HTTP RESP from %s:%s:\n%s", ip, port, "\n".join(header_lines))
+                        except Exception as e:
+                            _LOGGER.warning(">>> CCTV HTTP read err on %s:%s: %s", ip, port, e)
+
+                    # Try RTSP OPTIONS for port 554 / 8554
+                    if port in (554, 8554):
+                        try:
+                            r2, w2 = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=1.5)
+                            w2.write(f"OPTIONS rtsp://{ip}:{port}/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: HomeAssistant\r\n\r\n".encode())
+                            await w2.drain()
+                            resp = await asyncio.wait_for(r2.read(1024), timeout=1.5)
+                            w2.close()
+                            await asyncio.wait_for(w2.wait_closed(), timeout=1.0)
+                            _LOGGER.warning(">>> CCTV RTSP RESP from %s:%s:\n%s", ip, port, resp.decode(errors='ignore'))
+                        except Exception as e:
+                            _LOGGER.warning(">>> CCTV RTSP read err on %s:%s: %s", ip, port, e)
+
+                except Exception:
+                    pass
+        _LOGGER.warning("=== 🏁 CCTV Web TX Probing Completed ===")
 
     async def _retry_loop(self) -> None:
         """Background worker to retry queued commands periodically."""
